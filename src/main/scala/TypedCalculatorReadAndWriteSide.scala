@@ -13,12 +13,13 @@ import akka.persistence.query.{EventEnvelope, PersistenceQuery}
 import akka.persistence.typed.PersistenceId
 import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
 import akka.stream.ActorMaterializer
-import akka.stream.scaladsl.{Sink, Source}
+import akka.stream.scaladsl.{Flow, Sink, Source}
 import akka.actor.typed.ActorSystem
 import akka.actor.typed.scaladsl.Behaviors
 import akka.stream.alpakka.slick.scaladsl.{Slick, SlickSession}
 import akka_typed.CalculatorRepository.{getLatestOffsetAndResult, initDataBase, updateResultAndOfsset}
 import com.typesafe.config.ConfigFactory
+import slick.sql.SqlAction
 
 import scala.concurrent.duration._
 import scala.io.StdIn
@@ -120,36 +121,38 @@ object akka_typed {
 
     implicit val session = SlickSession.forConfig("postgres")
     import session.profile.api._
-    val source: Source[EventEnvelope, NotUsed] = readJournal
-      .eventsByPersistenceId("001", startOffset, Long.MaxValue)
+    val source: Source[EventEnvelope, NotUsed] =
+      PersistenceQuery(system)
+        .readJournalFor[CassandraReadJournal](CassandraReadJournal.Identifier)
+        .eventsByPersistenceId("001", startOffset, Long.MaxValue)
 
     case class Info(res:Double, offset: Long)
 
+    val businessFlow: Flow[EventEnvelope, Info, NotUsed] = Flow[EventEnvelope]
+      .map(e => e.event match {
+        case Added(sequenceNr, amount) =>
+          latestCalculatedResult += amount
+          Info(latestCalculatedResult, sequenceNr)
+        case Multiplied(sequenceNr, amount) =>
+          latestCalculatedResult *= amount
+          Info(latestCalculatedResult, sequenceNr)
+        case Divided(sequenceNr, amount) =>
+          latestCalculatedResult /= amount
+          Info(latestCalculatedResult, sequenceNr)
+      })
+
+    val updateDBFlow: Flow[Info, Unit, NotUsed] = Flow[Info].map { info =>
+      updateResultAndOfsset(info.res, info.offset)
+    }
+
     source
+      .async
       .map { x =>
         println(x.toString())
         x
       }
-      .map(e => (e.sequenceNr, e.event))
-      .collectType[(Long, Event)]
-      .map({
-        case (sequenceNr, Added(_, amount)) =>
-          latestCalculatedResult += amount
-          Info(latestCalculatedResult, sequenceNr)
-        case (sequenceNr, Multiplied(_, amount)) =>
-          latestCalculatedResult *= amount
-          Info(latestCalculatedResult, sequenceNr)
-        case (sequenceNr, Divided(_, amount)) =>
-          latestCalculatedResult /= amount
-          Info(latestCalculatedResult, sequenceNr)
-      })
-      .async
-      .via(
-        Slick
-          .flow(info =>
-            sqlu"update public.result set calculated_value = ${info.res}, write_side_offset = ${info.offset} where id = 1"
-          )
-      )
+      .via(businessFlow.async)
+      .via(updateDBFlow.async)
       .runWith(Sink.ignore)
   }
 
